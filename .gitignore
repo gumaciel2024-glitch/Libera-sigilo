@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+calibracao.json
+calibracao.tmp
+imagens/
+dados/
+.instancia-sigilo.lock
+instalacao.log
+*.xlsx
+!modelo_planilha.xlsx
