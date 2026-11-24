@@ -21,7 +21,7 @@ class App:
         self.journal = Journal(BASE / 'dados' / 'historico.jsonl')
         self.path = tk.StringVar()
         self.release = tk.BooleanVar(value=False)
-        root.title('SAJ | Remoção de sigilo de decisões — 0.2')
+        root.title('SAJ | Remoção de sigilo de decisões — 0.3')
         root.geometry('1080x750')
         ttk.Label(root, text='Remoção de sigilo de decisões', font=('Segoe UI', 18, 'bold')).pack(anchor='w', padx=18, pady=15)
         ttk.Label(root, text='Mouse, teclado e imagens | Comece na tela inicial do SAJ maximizado.').pack(anchor='w', padx=18)

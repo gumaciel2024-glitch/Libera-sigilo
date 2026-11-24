@@ -244,39 +244,62 @@ class Visual:
         raise RuntimeError('A janela permaneceu aberta: ' + TARGETS[key])
 
 class Autos:
-    """Read the document hierarchy exposed by Windows UI Automation."""
+    """Read the document hierarchy from native Windows controls or UI Automation."""
 
     def __init__(self, visual):
         from pywinauto import Desktop
 
         self.visual = visual
-        self.desktop = Desktop(backend='uia')
+        self.desktops = {backend: Desktop(backend=backend) for backend in ('win32', 'uia')}
+        self.backend = None
 
     def load(self, processo):
         visual = self.visual
+        self.backend = None
         end = time.monotonic() + 25
         while time.monotonic() < end:
             visual.dismiss_pending()
             window = visual.foreground()
-            root = self.process_root(window, processo)
-            if root is not None and root.children(control_type='TreeItem'):
-                visual.expected_window = window
-                visual.check()
-                return window
+            for backend in self.desktops:
+                root = self.process_root(window, processo, backend)
+                if root is not None and self.children(root, backend):
+                    self.backend = backend
+                    visual.expected_window = window
+                    visual.check()
+                    visual.log(f'Árvore de documentos lida via {backend}.')
+                    return window
             visual.wait(.4)
         raise Stopped(
             'O SAJ não expôs uma árvore de documentos com o número completo esperado.'
         )
 
-    def process_root(self, window, processo):
+    def children(self, node, backend=None):
+        if (backend or self.backend) == 'win32':
+            return node.children()
+        return node.children(control_type='TreeItem')
+
+    def label(self, node, backend=None):
+        if (backend or self.backend) == 'win32':
+            return node.text().strip()
+        return node.window_text().strip()
+
+    def process_root(self, window, processo, backend=None):
+        backend = backend or self.backend
         expected = digits(processo)
-        dialog = self.desktop.window(handle=window).wrapper_object()
+        dialog = self.desktops[backend].window(handle=window).wrapper_object()
+        if backend == 'win32':
+            trees = dialog.descendants(visible_only=True)
+            roots = (node for tree in trees if tree.friendly_class_name() == 'TreeView'
+                     for node in tree.roots())
+        else:
+            trees = dialog.descendants(control_type='Tree')
+            roots = (node for tree in trees if tree.is_visible()
+                     for node in self.children(tree, backend))
         candidates = []
-        for tree in dialog.descendants(control_type='Tree'):
-            for node in tree.children(control_type='TreeItem'):
-                label = node.window_text().strip()
-                if re.fullmatch(r'[0-9.\- ]+', label) and digits(label) == expected:
-                    candidates.append(node)
+        for node in roots:
+            label = self.label(node, backend)
+            if re.fullmatch(r'[0-9.\- ]+', label) and digits(label) == expected:
+                candidates.append(node)
         if len(candidates) > 1:
             raise Stopped('Mais de uma árvore contém o número completo do processo.')
         return candidates[0] if candidates else None
@@ -286,13 +309,13 @@ class Autos:
         root = self.process_root(window, processo)
         if root is None:
             raise Stopped('O número completo do processo deixou de aparecer na árvore.')
-        children = root.children(control_type='TreeItem')
+        children = self.children(root)
         if not children:
             raise Stopped('A árvore do processo ainda não apresenta documentos.')
-        sections = [node for node in children if normalize(node.window_text()) == 'PECAS SIGILOSAS']
+        sections = [node for node in children if normalize(self.label(node)) == 'PECAS SIGILOSAS']
         if len(sections) > 1:
             raise Stopped('Mais de uma seção Peças sigilosas foi encontrada.')
-        public_count = sum(normalize(node.window_text()) == 'DECISAO' for node in children)
+        public_count = sum(normalize(self.label(node)) == 'DECISAO' for node in children)
         if not sections:
             return [], public_count
 
@@ -309,10 +332,21 @@ class Autos:
             self.visual.check()
             if not section.is_expanded():
                 raise Stopped('Não foi possível abrir Peças sigilosas.')
-        items = section.children(control_type='TreeItem')
+        items = self.children(section)
+        end = time.monotonic() + 5
+        while not items and time.monotonic() < end:
+            self.visual.wait(.3)
+            root = self.process_root(window, processo)
+            if root is None:
+                raise Stopped('O processo mudou durante a abertura de Peças sigilosas.')
+            sections = [node for node in self.children(root)
+                        if normalize(self.label(node)) == 'PECAS SIGILOSAS']
+            if len(sections) != 1:
+                raise Stopped('A seção Peças sigilosas mudou durante a leitura.')
+            items = self.children(sections[0])
         if not items:
             raise Stopped('Peças sigilosas está visível, mas sua lista não pôde ser lida.')
-        decisions = [node for node in items if normalize(node.window_text()) == 'DECISAO']
+        decisions = [node for node in items if normalize(self.label(node)) == 'DECISAO']
         return decisions, public_count
 
     def verify_removal(self, window, processo, before):
@@ -386,12 +420,14 @@ class Runner:
                 if len(decisions) > 1:
                     raise Stopped('Há mais de uma decisão sigilosa neste processo.')
 
-                step('selecionar decisão e abrir menu do cadeado')
+                step('clicar na decisão dentro de Peças sigilosas')
                 self.v.check()
-                decisions[0].select()
+                decisions[0].click_input()
+                self.v.wait(.4)
                 selected, current_count = self.autos.decisions(window, p)
                 if len(selected) != 1 or current_count != public_count or not selected[0].is_selected():
                     raise Stopped('A seleção da decisão sigilosa não pôde ser conferida.')
+                step('abrir menu do cadeado')
                 self.v.click('cadeado', pending=False)
                 self.v.locate('remover_sigilo', pending=False)
                 if not release:
