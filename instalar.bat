@@ -19,7 +19,7 @@ set "SAJ_INSTALL_STAGE=instalar dependencias"
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt >> instalacao.log 2>&1
 if errorlevel 1 goto erro
 set "SAJ_INSTALL_STAGE=conferir dependencias"
-".venv\Scripts\python.exe" -c "import pyautogui, cv2, numpy, PIL, openpyxl, tkinter, pywinauto; print('Dependencias conferidas.')" >> instalacao.log 2>&1
+".venv\Scripts\python.exe" -c "import pyautogui, cv2, numpy, PIL, openpyxl, tkinter; print('Dependencias conferidas.')" >> instalacao.log 2>&1
 if errorlevel 1 goto erro
 echo.
 echo Instalacao concluida. Abra iniciar.bat.

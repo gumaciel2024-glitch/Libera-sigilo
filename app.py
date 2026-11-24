@@ -1,11 +1,14 @@
-"""SAJ — Remoção de sigilo de decisões, versão 0.1. Interface local para Windows."""
+"""SAJ — Remoção de sigilo de decisões, versão 0.4. Interface local para Windows."""
 import json
 import os
 import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from core import BASE, TARGETS, BATCH_TARGETS, Journal, Visual, Autos, Runner, read_sheet, digits, load_templates
+from core import (
+    BASE, TARGETS, BATCH_TARGETS, TREE_AREA, TREE_TARGETS, Journal, Visual, Runner,
+    read_sheet, digits, load_templates,
+)
 
 CONFIG = BASE / 'calibracao.json'
 
@@ -21,7 +24,7 @@ class App:
         self.journal = Journal(BASE / 'dados' / 'historico.jsonl')
         self.path = tk.StringVar()
         self.release = tk.BooleanVar(value=False)
-        root.title('SAJ | Remoção de sigilo de decisões — 0.3')
+        root.title('SAJ | Remoção de sigilo de decisões — 0.4')
         root.geometry('1080x750')
         ttk.Label(root, text='Remoção de sigilo de decisões', font=('Segoe UI', 18, 'bold')).pack(anchor='w', padx=18, pady=15)
         ttk.Label(root, text='Mouse, teclado e imagens | Comece na tela inicial do SAJ maximizado.').pack(anchor='w', padx=18)
@@ -93,15 +96,17 @@ class App:
 
     def calibrate(self):
         if self.busy(): return
-        win = tk.Toplevel(self.root); win.title('Calibração visual'); win.geometry('800x720'); win.grab_set()
+        win = tk.Toplevel(self.root); win.title('Calibração visual'); win.geometry('800x760'); win.grab_set()
         ttk.Label(win, text='Abra manualmente cada etapa no SAJ, depois capture a referência correspondente.\nRecorte somente elementos fixos; evite números de processo e datas.\nCaixas: recorte a caixa e sua borda. Capture marcada e desmarcada separadamente.\nApós o recorte, clique no ponto que receberá o clique (pode ficar fora do recorte).', wraplength=760).pack(padx=15, pady=15)
-        for key, label in TARGETS.items():
+        targets = {TREE_AREA: 'Área da árvore de documentos (painel superior esquerdo)', **TARGETS}
+        for key, label in targets.items():
             row = ttk.Frame(win); row.pack(fill='x', padx=15, pady=3)
-            status = tk.StringVar(value='✓' if key in self.config['targets'] else '—')
+            configured = (key in self.config) if key == TREE_AREA else (key in self.config['targets'])
+            status = tk.StringVar(value='✓' if configured else '—')
             ttk.Label(row, textvariable=status, width=3).pack(side='left')
             ttk.Label(row, text=label).pack(side='left')
             ttk.Button(row, text='Capturar', command=lambda k=key, s=status: self.capture(win, k, s)).pack(side='right')
-        ttk.Label(win, text='Limpar e Processo vazio são usados no lote. Capture Limpar e o campo Processo vazio na Visualização de Autos.\nO indicador “Mostrando 1 de 1” deve ser recortado inteiro.\nPendências: capture somente o título. Remover sigilo: capture a opção inteira.\nMantenha resolução, escala do Windows e tamanho dos painéis após calibrar.', wraplength=760).pack(pady=15)
+        ttk.Label(win, text='Limpar e Processo vazio são usados no lote. Capture Limpar e o campo Processo vazio na Visualização de Autos.\nO indicador “Mostrando 1 de 1” deve ser recortado inteiro.\nPendências: capture somente o título. Remover sigilo: capture a opção inteira.\nÁrea da árvore: inclua só a lista superior de documentos, acima de Peças aguardando liberação.\nPeças sigilosas e Decisão: recorte só os rótulos sem seleção. Em Decisão use a linha recuada dentro da seção.\nMantenha resolução, escala do Windows e tamanho dos painéis após calibrar.', wraplength=760).pack(pady=15)
 
     def capture(self, win, key, status):
         if self.busy(): return
@@ -125,6 +130,8 @@ class App:
                 canvas.create_image(0, 0, image=canvas.picture, anchor='nw')
                 note = canvas.create_text(20, 20, anchor='nw', fill='red', font=('Segoe UI', 15, 'bold'), text='Arraste para recortar a referência. Esc cancela.')
                 state = {}
+                if key == TREE_AREA:
+                    canvas.itemconfigure(note, text='Arraste pela área da árvore superior de Documentos. Esc cancela.')
                 def cancel(event=None): overlay.destroy(); restore()
                 def down(event):
                     if 'box' in state:
@@ -137,9 +144,14 @@ class App:
                 def up(event):
                     if 'box' in state or 'start' not in state: return
                     x1, x2 = sorted((state['start'][0], event.x)); y1, y2 = sorted((state['start'][1], event.y))
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(image.width, x2), min(image.height, y2)
                     if x2-x1 < 6 or y2-y1 < 6:
                         state.pop('start', None); return
                     state['box'] = (x1, y1, x2, y2)
+                    if key == TREE_AREA:
+                        save(event)
+                        return
                     canvas.itemconfigure(note, text='Agora clique no ponto de ação. Para título/indicador, clique no centro do recorte.')
                 def save(event):
                     try:
@@ -147,18 +159,34 @@ class App:
                         resolution = [image.width, image.height]
                         if self.config.get('resolution', resolution) != resolution:
                             raise ValueError('Resolução diferente da calibração anterior. Restaure a resolução original.')
-                        folder = BASE / 'imagens'; folder.mkdir(exist_ok=True)
-                        relative = f'imagens/{key}.png'; image.crop(state['box']).save(BASE / relative)
-                        # Região estreita mantém caixas genéricas vinculadas à posição calibrada.
-                        margin = 3 if key in {'selecionar_processo', 'processo_marcado'} else 16
-                        left, top = max(0, x1-margin), max(0, y1-margin)
-                        right, bottom = min(image.width, x2+margin), min(image.height, y2+margin)
-                        if key == 'remover_sigilo':
-                            top, bottom = 0, image.height
+                        if key == TREE_AREA:
+                            self.config[TREE_AREA] = [x1, y1, x2-x1, y2-y1]
+                            label = 'Área da árvore de documentos'
+                        else:
+                            if key in TREE_TARGETS and not (x1 <= event.x < x2 and y1 <= event.y < y2):
+                                raise ValueError('Clique dentro do rótulo recortado.')
+                            folder = BASE / 'imagens'
+                            folder.mkdir(exist_ok=True)
+                            relative = f'imagens/{key}.png'
+                            image.crop(state['box']).save(BASE / relative)
+                            # Os rótulos da árvore variam em altura e conservam a indentação.
+                            narrow_targets = TREE_TARGETS | {'selecionar_processo', 'processo_marcado'}
+                            margin = 3 if key in narrow_targets else 16
+                            left, top = max(0, x1-margin), max(0, y1-margin)
+                            right, bottom = min(image.width, x2+margin), min(image.height, y2+margin)
+                            if key == 'remover_sigilo':
+                                top, bottom = 0, image.height
+                            self.config['targets'][key] = {
+                                'image': relative, 'region': [left, top, right-left, bottom-top],
+                                'offset': [event.x-x1, event.y-y1], 'confidence': .97,
+                            }
+                            label = TARGETS[key]
                         self.config['resolution'] = resolution
-                        self.config['targets'][key] = {'image': relative, 'region': [left, top, right-left, bottom-top], 'offset': [event.x-x1, event.y-y1], 'confidence': .97}
-                        temp = CONFIG.with_suffix('.tmp'); temp.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding='utf-8'); temp.replace(CONFIG)
-                        status.set('✓'); self.say('Calibrado: ' + TARGETS[key])
+                        temp = CONFIG.with_suffix('.tmp')
+                        temp.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding='utf-8')
+                        temp.replace(CONFIG)
+                        status.set('✓')
+                        self.say('Calibrado: ' + label)
                     except Exception as exc: messagebox.showerror('Calibração', str(exc), parent=overlay)
                     finally: cancel()
                 canvas.bind('<ButtonPress-1>', down); canvas.bind('<B1-Motion>', drag); canvas.bind('<ButtonRelease-1>', up)
@@ -183,7 +211,18 @@ class App:
             if batch and not release: raise ValueError('Faça o ensaio individual. Para lote, marque Remover sigilo.')
             needed = set(TARGETS) - (BATCH_TARGETS if len(ids) == 1 else set())
             missing = [TARGETS[k] for k in TARGETS if k in needed and k not in self.config['targets']]
+            if TREE_AREA not in self.config:
+                missing.insert(0, 'Área da árvore de documentos')
             if missing: raise ValueError('Calibre antes:\n' + '\n'.join(missing))
+            tree_x, tree_y, tree_w, tree_h = self.config[TREE_AREA]
+            section = self.config['targets']['secao_sigilosas']['region']
+            decision = self.config['targets']['decisao_sigilosas']['region']
+            for x, y, width, height in (section, decision):
+                if not (tree_x <= x and x + width <= tree_x + tree_w
+                        and tree_y <= y + height // 2 < tree_y + tree_h):
+                    raise ValueError('Recapture os rótulos dentro da área da árvore de documentos.')
+            if decision[0] - section[0] <= 6:
+                raise ValueError('Recapture a Decisão recuada dentro de Peças sigilosas.')
             templates = load_templates(self.config, needed, cv2, numpy)
             if list(pyautogui.size()) != self.config['resolution']: raise ValueError('Resolução diferente da calibração.')
         except Exception as exc:
@@ -197,9 +236,9 @@ class App:
                 visual = Visual(config, self.stop, self.say, templates=templates)
                 self.say('Início em 5 segundos. Volte à tela inicial do SAJ.')
                 visual.wait(5)
-                runner = Runner(visual, Autos(visual), self.journal, self.say, lambda i, text: self.events.put(('row', (ids[i], text))))
+                runner = Runner(visual, self.journal, self.say, lambda i, text: self.events.put(('row', (ids[i], text))))
                 runner.run(records, release=release)
-                message = 'Execução encerrada. Confira os resultados no SAJ.'
+                message = 'Execução encerrada. Consulte os cliques enviados na tabela.'
             except Exception as exc:
                 self.say('Interrompido: ' + str(exc)); message = 'Execução interrompida:\n' + str(exc)
             self.events.put(('done', message))
