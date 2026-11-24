@@ -5,7 +5,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from core import BASE, TARGETS, BATCH_TARGETS, Journal, Visual, Runner, read_sheet, digits, load_templates
+from core import BASE, TARGETS, BATCH_TARGETS, Journal, Visual, Autos, Runner, read_sheet, digits, load_templates
 
 CONFIG = BASE / 'calibracao.json'
 
@@ -21,7 +21,7 @@ class App:
         self.journal = Journal(BASE / 'dados' / 'historico.jsonl')
         self.path = tk.StringVar()
         self.release = tk.BooleanVar(value=False)
-        root.title('SAJ | Remoção de sigilo de decisões — 0.1')
+        root.title('SAJ | Remoção de sigilo de decisões — 0.2')
         root.geometry('1080x750')
         ttk.Label(root, text='Remoção de sigilo de decisões', font=('Segoe UI', 18, 'bold')).pack(anchor='w', padx=18, pady=15)
         ttk.Label(root, text='Mouse, teclado e imagens | Comece na tela inicial do SAJ maximizado.').pack(anchor='w', padx=18)
@@ -41,7 +41,7 @@ class App:
         ttk.Button(row, text='Executar selecionado', command=lambda: self.start(False)).pack(side='left')
         ttk.Button(row, text='Executar lote pendente', command=lambda: self.start(True)).pack(side='left', padx=8)
         ttk.Button(row, text='PARAR', command=self.stop.set).pack(side='left')
-        ttk.Label(root, text='Emergência: mouse no canto superior esquerdo. Interaja com o SAJ apenas durante as conferências solicitadas.').pack(anchor='w', padx=18, pady=10)
+        ttk.Label(root, text='Emergência: mouse no canto superior esquerdo. Mantenha o SAJ em primeiro plano durante a execução.').pack(anchor='w', padx=18, pady=10)
         self.log = tk.Text(root, height=10, state='disabled', font=('Consolas', 10))
         self.log.pack(fill='x', padx=18, pady=(0, 15))
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -78,16 +78,10 @@ class App:
                 if kind == 'log':
                     self.log.configure(state='normal'); self.log.insert('end', data + '\n'); self.log.see('end'); self.log.configure(state='disabled')
                 elif kind == 'row': self.table.set(str(data[0]), 'resultado', data[1])
-                elif kind == 'confirm':
-                    title, instruction, answer = data
-                    try:
-                        answer.put(messagebox.askyesnocancel(title, instruction, parent=self.root))
-                    except tk.TclError:
-                        answer.put(None)
                 elif kind == 'done':
                     self.running = False
                     self.root.deiconify()
-                    messagebox.showinfo('Execução', data)
+                    self.say(data)
         except queue.Empty: pass
         self.root.after(100, self.poll)
 
@@ -107,7 +101,7 @@ class App:
             ttk.Label(row, textvariable=status, width=3).pack(side='left')
             ttk.Label(row, text=label).pack(side='left')
             ttk.Button(row, text='Capturar', command=lambda k=key, s=status: self.capture(win, k, s)).pack(side='right')
-        ttk.Label(win, text='Limpar e Processo vazio são usados no lote. Capture Limpar e o campo Processo vazio na Visualização de Autos.\nO indicador “Mostrando 1 de 1” deve ser recortado inteiro.\nPendências: capture somente o título. Decisão: capture o texto selecionado. Remover sigilo: capture a opção inteira.\nMantenha resolução, escala do Windows e tamanho dos painéis após calibrar.', wraplength=760).pack(pady=15)
+        ttk.Label(win, text='Limpar e Processo vazio são usados no lote. Capture Limpar e o campo Processo vazio na Visualização de Autos.\nO indicador “Mostrando 1 de 1” deve ser recortado inteiro.\nPendências: capture somente o título. Remover sigilo: capture a opção inteira.\nMantenha resolução, escala do Windows e tamanho dos painéis após calibrar.', wraplength=760).pack(pady=15)
 
     def capture(self, win, key, status):
         if self.busy(): return
@@ -159,7 +153,7 @@ class App:
                         margin = 3 if key in {'selecionar_processo', 'processo_marcado'} else 16
                         left, top = max(0, x1-margin), max(0, y1-margin)
                         right, bottom = min(image.width, x2+margin), min(image.height, y2+margin)
-                        if key in {'pecas_sigilosas', 'decisao_selecionada', 'remover_sigilo'}:
+                        if key == 'remover_sigilo':
                             top, bottom = 0, image.height
                         self.config['resolution'] = resolution
                         self.config['targets'][key] = {'image': relative, 'region': [left, top, right-left, bottom-top], 'offset': [event.x-x1, event.y-y1], 'confidence': .97}
@@ -198,18 +192,13 @@ class App:
         records = [dict(self.records[int(i)]) for i in ids]
         config = json.loads(json.dumps(self.config))
         self.root.iconify()
-        def confirm(title, instruction):
-            answer = queue.Queue(maxsize=1)
-            self.events.put(('confirm', (title, instruction, answer)))
-            return answer.get()
-
         def work():
             try:
                 visual = Visual(config, self.stop, self.say, templates=templates)
                 self.say('Início em 5 segundos. Volte à tela inicial do SAJ.')
                 visual.wait(5)
-                runner = Runner(visual, self.journal, self.say, lambda i, text: self.events.put(('row', (ids[i], text))))
-                runner.run(records, release=release, confirm=confirm)
+                runner = Runner(visual, Autos(visual), self.journal, self.say, lambda i, text: self.events.put(('row', (ids[i], text))))
+                runner.run(records, release=release)
                 message = 'Execução encerrada. Confira os resultados no SAJ.'
             except Exception as exc:
                 self.say('Interrompido: ' + str(exc)); message = 'Execução interrompida:\n' + str(exc)
@@ -218,7 +207,8 @@ class App:
 
     def close(self):
         if self.running:
-            self.stop.set(); messagebox.showinfo('Parando', 'Aguarde a execução encerrar antes de fechar.'); return
+            self.stop.set()
+            return
         if not self.calibrating: self.root.destroy()
 
 if __name__ == '__main__':

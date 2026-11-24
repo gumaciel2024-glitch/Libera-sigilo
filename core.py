@@ -18,8 +18,6 @@ TARGETS = {
     'processo_marcado': '07 — Caixa MARCADA da linha do resultado',
     'pendencias': '08 — Título Pendências e Prazos do Processo',
     'autos': '10 — Título Visualização de Autos',
-    'pecas_sigilosas': 'Peças sigilosas — rótulo da seção',
-    'decisao_selecionada': 'Decisão — texto com destaque de seleção',
     'cadeado': 'Cadeado — botão habilitado',
     'remover_sigilo': 'Remover sigilo — opção do menu sem realce',
     'limpar': '16 — Limpar na Visualização de Autos',
@@ -161,13 +159,6 @@ class Visual:
             raise RuntimeError('Nenhuma janela ativa.')
         return window
 
-    def resume(self, window):
-        self.expected_window = None
-        self.log('Volte à mesma janela de autos do SAJ em 5 segundos.')
-        self.wait(5)
-        self.expected_window = window
-        self.check()
-
     def check(self):
         if self.stop.is_set():
             raise Stopped('Parada solicitada; confira o SAJ antes de retomar.')
@@ -252,11 +243,94 @@ class Visual:
             self.wait(.4)
         raise RuntimeError('A janela permaneceu aberta: ' + TARGETS[key])
 
-class Runner:
-    def __init__(self, visual, journal, log, update):
-        self.v, self.journal, self.log, self.update = visual, journal, log, update
+class Autos:
+    """Read the document hierarchy exposed by Windows UI Automation."""
 
-    def run(self, records, release, confirm):
+    def __init__(self, visual):
+        from pywinauto import Desktop
+
+        self.visual = visual
+        self.desktop = Desktop(backend='uia')
+
+    def load(self, processo):
+        visual = self.visual
+        end = time.monotonic() + 25
+        while time.monotonic() < end:
+            visual.dismiss_pending()
+            window = visual.foreground()
+            root = self.process_root(window, processo)
+            if root is not None and root.children(control_type='TreeItem'):
+                visual.expected_window = window
+                visual.check()
+                return window
+            visual.wait(.4)
+        raise Stopped(
+            'O SAJ não expôs uma árvore de documentos com o número completo esperado.'
+        )
+
+    def process_root(self, window, processo):
+        expected = digits(processo)
+        dialog = self.desktop.window(handle=window).wrapper_object()
+        candidates = []
+        for tree in dialog.descendants(control_type='Tree'):
+            for node in tree.children(control_type='TreeItem'):
+                label = node.window_text().strip()
+                if re.fullmatch(r'[0-9.\- ]+', label) and digits(label) == expected:
+                    candidates.append(node)
+        if len(candidates) > 1:
+            raise Stopped('Mais de uma árvore contém o número completo do processo.')
+        return candidates[0] if candidates else None
+
+    def decisions(self, window, processo):
+        self.visual.check()
+        root = self.process_root(window, processo)
+        if root is None:
+            raise Stopped('O número completo do processo deixou de aparecer na árvore.')
+        children = root.children(control_type='TreeItem')
+        if not children:
+            raise Stopped('A árvore do processo ainda não apresenta documentos.')
+        sections = [node for node in children if normalize(node.window_text()) == 'PECAS SIGILOSAS']
+        if len(sections) > 1:
+            raise Stopped('Mais de uma seção Peças sigilosas foi encontrada.')
+        public_count = sum(normalize(node.window_text()) == 'DECISAO' for node in children)
+        if not sections:
+            return [], public_count
+
+        section = sections[0]
+        if not section.is_expanded():
+            self.visual.check()
+            section.expand()
+            # The SAJ can open a separate pending dialog while expanding the section.
+            self.visual.expected_window = None
+            try:
+                self.visual.dismiss_pending()
+            finally:
+                self.visual.expected_window = window
+            self.visual.check()
+            if not section.is_expanded():
+                raise Stopped('Não foi possível abrir Peças sigilosas.')
+        items = section.children(control_type='TreeItem')
+        if not items:
+            raise Stopped('Peças sigilosas está visível, mas sua lista não pôde ser lida.')
+        decisions = [node for node in items if normalize(node.window_text()) == 'DECISAO']
+        return decisions, public_count
+
+    def verify_removal(self, window, processo, before):
+        end = time.monotonic() + 15
+        while time.monotonic() < end:
+            decisions, public_count = self.decisions(window, processo)
+            if not decisions and public_count == before + 1:
+                return
+            self.visual.wait(.4)
+        raise Stopped('Remoção sem confirmação na árvore dos autos. Confira o histórico e o SAJ.')
+
+
+class Runner:
+    def __init__(self, visual, autos, journal, log, update):
+        self.v, self.autos = visual, autos
+        self.journal, self.log, self.update = journal, log, update
+
+    def run(self, records, release):
         phase = 'preparação'
         for index, r in enumerate(records):
             p = r['processo']
@@ -270,7 +344,6 @@ class Runner:
                     phase = name
                     self.log(f'{p} — {name}')
                     self.update(index, name)
-                self.v.expected_window = None
                 if index == 0:
                     step('abrir Fluxo de Trabalho')
                     self.v.click('fluxo')
@@ -300,38 +373,25 @@ class Runner:
                     self.v.check()
                     self.v.pg.hotkey('ctrl', 'a')
                     self.v.pg.write(query_number(p), interval=.12)
+                    self.v.expected_window = None
                     step('aguardar visualização de autos')
                     self.v.locate('autos')
-                step('verificar decisão em Peças sigilosas')
-                if self.v.find('pecas_sigilosas') is not None:
-                    self.v.click('pecas_sigilosas')
-                    self.v.dismiss_pending()
-                window = self.v.foreground()
-
-                instruction = (
-                    f'Confirme os 20 dígitos do processo {p} no SAJ.\n\n'
-                    'Abra Peças sigilosas, se necessário. Se houver exatamente uma decisão '
-                    'nessa seção, selecione essa decisão nos autos.\n\n'
-                    'Sim: conferi o processo e selecionei a decisão sigilosa.\n'
-                    'Não: conferi o processo e não há decisão sigilosa.\n'
-                    'Cancelar: há várias decisões, há dúvida ou quero parar.'
-                )
-                choice = confirm('Conferir processo e decisão', instruction)
-                if choice is None:
-                    raise Stopped('Conferência cancelada.')
-                if not choice:
+                step('conferir número completo e localizar decisão sigilosa')
+                window = self.autos.load(p)
+                decisions, public_count = self.autos.decisions(window, p)
+                if not decisions:
                     self.journal.write(p, 'sem_decisao', phase)
-                    self.update(index, 'Sem decisão sigilosa — conferido')
-                    if index + 1 < len(records):
-                        self.v.resume(window)
+                    self.update(index, 'Sem decisão sigilosa')
                     continue
+                if len(decisions) > 1:
+                    raise Stopped('Há mais de uma decisão sigilosa neste processo.')
 
-                self.v.resume(window)
-                step('abrir menu do cadeado')
-                section = self.v.locate('pecas_sigilosas', pending=False)
-                decision = self.v.locate('decisao_selecionada', pending=False)
-                if decision[0] <= section[0] or decision[1] <= section[1]:
-                    raise Stopped('A decisão selecionada não está abaixo e à direita de Peças sigilosas.')
+                step('selecionar decisão e abrir menu do cadeado')
+                self.v.check()
+                decisions[0].select()
+                selected, current_count = self.autos.decisions(window, p)
+                if len(selected) != 1 or current_count != public_count or not selected[0].is_selected():
+                    raise Stopped('A seleção da decisão sigilosa não pôde ser conferida.')
                 self.v.click('cadeado', pending=False)
                 self.v.locate('remover_sigilo', pending=False)
                 if not release:
@@ -343,15 +403,10 @@ class Runner:
                 self.journal.write(p, 'remocao_solicitada', phase)
                 self.v.click('remover_sigilo', pending=False)
                 self.v.until_absent('remover_sigilo', pending=False)
-                self.journal.write(p, 'menu_fechado', phase)
-                step('conferir remoção nos autos')
-                if confirm('Conferir remoção', f'No SAJ, confira se a decisão do processo {p} '
-                           'saiu de Peças sigilosas. Clique em Sim somente após conferir.') is not True:
-                    raise Stopped('Remoção sem confirmação; confira o SAJ antes de retomar.')
+                step('verificar remoção na árvore dos autos')
+                self.autos.verify_removal(window, p, public_count)
                 self.journal.write(p, 'remocao_conferida', phase)
-                self.update(index, 'Remoção conferida')
-                if index + 1 < len(records):
-                    self.v.resume(window)
+                self.update(index, 'Remoção conferida automaticamente')
             except Exception as exc:
                 self.journal.write(p, 'interrompido', phase, str(exc))
                 self.update(index, 'Interrompido — conferir SAJ')
